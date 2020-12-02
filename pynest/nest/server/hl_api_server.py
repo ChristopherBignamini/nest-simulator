@@ -23,6 +23,7 @@ import importlib
 import inspect
 import io
 import sys
+import glob
 
 import flask
 from flask import Flask, request, jsonify
@@ -33,10 +34,18 @@ from werkzeug.wrappers import Response
 
 import nest
 import RestrictedPython
+import time
+import numpy
+
+import site
+site.addsitedir('/opt/data')
+print('---------------- starting BF entrypoint----')
 
 import os
 MODULES = os.environ.get('NEST_SERVER_MODULES', 'nest').split(',')
 RESTRICTION_OFF = bool(os.environ.get('NEST_SERVER_RESTRICTION_OFF', False))
+EXCEPTION_ERROR_STATUS = 400
+NEST_ERROR_STATUS = 400
 
 if RESTRICTION_OFF:
     print('*** WARNING: NEST Server is run without a RestrictedPython trusted environment. ***')
@@ -52,7 +61,7 @@ CORS(app)
 
 @app.route('/', methods=['GET'])
 def index():
-    return jsonify({'nest': nest.version()})
+    return jsonify({'nest': nest.__version__})
 
 
 @app.route('/exec', methods=['GET', 'POST'])
@@ -89,9 +98,11 @@ def route_exec():
         return jsonify(response)
 
     except nest.kernel.NESTError as e:
-        abort(Response(getattr(e, 'errormessage'), 400))
+        print('NEST error: {}'.format(e))
+        abort(Response(getattr(e, 'errormessage'), NEST_ERROR_STATUS))
     except Exception as e:
-        abort(Response(str(e), 400))
+        print('Error: {}'.format(e))
+        abort(Response(str(e), EXCEPTION_ERROR_STATUS))
 
 
 # --------------------------
@@ -180,8 +191,13 @@ def get_globals():
     modules = dict([(module, importlib.import_module(module)) for module in MODULES])
     copied_globals.update(modules)
 
-    return copied_globals
+    # Add user modules from /opt/data to copied globals
+    user_modules_list_files = [mod[10:-1] for mod in glob.glob('/opt/data/*/') if os.path.isfile(mod + '__init__.py') ]
+    user_modules_list_dirs = [mod[10:-3] for mod in glob.glob('/opt/data/*.py')]
+    user_modules = dict([(module, importlib.import_module(module)) for module in user_modules_list_files + user_modules_list_dirs])
+    copied_globals.update(user_modules)
 
+    return copied_globals
 
 def get_or_error(func):
     """ Wrapper to get data and status.
@@ -190,9 +206,14 @@ def get_or_error(func):
         try:
             return func(call, args, kwargs)
         except nest.kernel.NESTError as e:
-            abort(Response(getattr(e, 'errormessage'), 400))
+            print('NEST error: {}'.format(e))
+            abort(Response(getattr(e, 'errormessage'), NEST_ERROR_STATUS))
+        except TypeError as e:
+            print('Type error: {}'.format(e))
+            abort(Response(str(e), EXCEPTION_ERROR_STATUS))
         except Exception as e:
-            abort(Response(str(e), 400))
+            print('Error: {}'.format(e))
+            abort(Response(str(e), EXCEPTION_ERROR_STATUS))
     return func_wrapper
 
 
@@ -200,14 +221,21 @@ def get_restricted_globals():
     """ Get restricted globals for exec function.
     """
     def getitem(obj, index):
-        if obj is not None and type(obj) in (list, tuple, dict):
+        if obj is not None and type(obj) in (list, tuple, dict, nest.NodeCollection):
             return obj[index]
-        raise Exception()
+        msg = f"Error while getting restricted globals: unidentified object '{obj}'."
+        raise TypeError(msg)
 
     restricted_builtins = RestrictedPython.safe_builtins.copy()
     restricted_builtins.update(RestrictedPython.limited_builtins)
     restricted_builtins.update(RestrictedPython.utility_builtins)
-    restricted_builtins.update(dict(max=max, min=min, sum=sum))
+    restricted_builtins.update(dict(
+        max=max,
+        min=min,
+        sum=sum,
+        time=time,
+	numpy=numpy,
+	open=open))
 
     restricted_globals = dict(
         __builtins__=restricted_builtins,
@@ -215,12 +243,22 @@ def get_restricted_globals():
         _getattr_=RestrictedPython.Guards.safer_getattr,
         _getitem_=getitem,
         _getiter_=iter,
+        _unpack_sequence_=RestrictedPython.Guards.guarded_unpack_sequence,
+        _write_=RestrictedPython.Guards.full_write_guard,
     )
 
     # Add modules to restricted globals
     modules = dict([(module, importlib.import_module(module)) for module in MODULES])
     restricted_globals.update(modules)
 
+    # Add user modules from /opt/data to copied globals
+    user_modules_list_files = [mod[10:-1] for mod in glob.glob('/opt/data/*/') if os.path.isfile(mod + '__init__.py') ]
+    user_modules_list_dirs = [mod[10:-3] for mod in glob.glob('/opt/data/*.py')]
+    user_modules = dict([(module, importlib.import_module(module)) for module in user_modules_list_files + user_modules_list_dirs])
+    restricted_globals.update(user_modules)
+
+    #test_module.printer()
+    
     return restricted_globals
 
 
